@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/convert.py": {
+      "runtime": "python3.9"
+    }
+  }
+}
