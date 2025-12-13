@@ -1,4 +1,24 @@
 # api/convert.py
+import sys
+import logging
+
+# Add logging to see what's available
+logging.basicConfig(level=logging.INFO)
+logging.info(f"Python version: {sys.version}")
+
+# Try importing the libraries
+try:
+    import openpyxl
+    logging.info(f"openpyxl version: {openpyxl.__version__}")
+except ImportError as e:
+    logging.error(f"Failed to import openpyxl: {e}")
+
+try:
+    import reportlab
+    logging.info(f"reportlab version: {reportlab.__version__}")
+except ImportError as e:
+    logging.error(f"Failed to import reportlab: {e}")
+    
 from http.server import BaseHTTPRequestHandler
 import json
 import io
