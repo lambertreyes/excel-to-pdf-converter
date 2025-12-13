@@ -9,13 +9,20 @@ from reportlab.lib import colors
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
-            # Read request body
-            content_length = int(self.headers.get('Content-Length', 0))
-            if content_length == 0:
-                self.send_error(400, "No content")
+            # Read all available data
+            content_length = self.headers.get('Content-Length')
+            if content_length:
+                body = self.rfile.read(int(content_length))
+            else:
+                # Try to read without content length
+                body = self.rfile.read()
+            
+            if not body or len(body) == 0:
+                self.send_response(400)
+                self.send_header('Content-Type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(b"Empty body received")
                 return
-                
-            body = self.rfile.read(content_length)
             
             # Load workbook
             wb = load_workbook(io.BytesIO(body), data_only=True)
@@ -53,4 +60,12 @@ class handler(BaseHTTPRequestHandler):
             self.send_response(500)
             self.send_header('Content-Type', 'text/plain')
             self.end_headers()
-            self.wfile.write(str(e).encode())
+            error_msg = f"Error: {str(e)}"
+            self.wfile.write(error_msg.encode())
+    
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.end_headers()
