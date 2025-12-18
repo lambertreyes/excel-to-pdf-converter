@@ -53,47 +53,11 @@ export default async function handler(req, res) {
 
 async function createPDF(worksheet, workbook) {
   return new Promise((resolve, reject) => {
-    // Check for print area
-    let minRow = 1, maxRow = 49, minCol = 1, maxCol = 15;
-    
-    if (worksheet.pageSetup && worksheet.pageSetup.printArea) {
-      const printArea = worksheet.pageSetup.printArea;
-      const match = printArea.match(/([A-Z]+)(\d+):([A-Z]+)(\d+)/);
-      if (match) {
-        minCol = columnLetterToNumber(match[1]);
-        minRow = parseInt(match[2]);
-        maxCol = columnLetterToNumber(match[3]);
-        maxRow = parseInt(match[4]);
-      }
-    }
-
-    // Detect actual data boundaries if no print area
-    if (!worksheet.pageSetup || !worksheet.pageSetup.printArea) {
-      let hasData = false;
-      worksheet.eachRow((row, rowNum) => {
-        row.eachCell({ includeEmpty: false }, (cell, colNum) => {
-          if (cell.value !== null && cell.value !== undefined && cell.value !== '') {
-            hasData = true;
-            maxRow = Math.max(maxRow, rowNum);
-            maxCol = Math.max(maxCol, colNum);
-          }
-        });
-      });
-      
-      if (hasData) {
-        // Add small buffer
-        maxRow = Math.min(maxRow + 1, 49);
-        maxCol = Math.min(maxCol, 15);
-      }
-    }
-
-    // Determine page orientation from Excel settings
-    const orientation = worksheet.pageSetup && worksheet.pageSetup.orientation === 'landscape' ? 'landscape' : 'portrait';
-    
+    // Force A4 Portrait to match your checklist
     const doc = new PDFDocument({ 
       size: 'A4',
-      margin: 20,
-      layout: orientation,
+      margin: 15,
+      layout: 'portrait',
       bufferPages: true
     });
     
@@ -102,114 +66,114 @@ async function createPDF(worksheet, workbook) {
     doc.on('end', () => resolve(Buffer.concat(chunks)));
     doc.on('error', reject);
 
-    // Get merged cells info
-    const mergedRanges = [];
-    for (const key in worksheet._merges) {
-      const range = worksheet._merges[key];
-      if (typeof range === 'string') {
-        mergedRanges.push(range);
-      } else if (range.model) {
-        mergedRanges.push(range.model);
-      }
-    }
+    // Define print range - force A1:O49 for your checklist
+    const minRow = 1;
+    const maxRow = 49;
+    const minCol = 1;
+    const maxCol = 15; // Column O
 
-    // Helper to check if cell is part of merged range
-    function getMergeInfo(rowNum, colNum) {
-      for (const range of mergedRanges) {
-        const rangeStr = typeof range === 'string' ? range : String(range);
-        const match = rangeStr.match(/([A-Z]+)(\d+):([A-Z]+)(\d+)/);
+    // Build merged cells map
+    const mergedCellsMap = new Map();
+    const processedMerges = new Set();
+    
+    if (worksheet._merges) {
+      Object.values(worksheet._merges).forEach(merge => {
+        const rangeStr = typeof merge === 'string' ? merge : (merge.model || merge);
+        const match = String(rangeStr).match(/([A-Z]+)(\d+):([A-Z]+)(\d+)/);
         if (match) {
           const startCol = columnLetterToNumber(match[1]);
           const startRow = parseInt(match[2]);
           const endCol = columnLetterToNumber(match[3]);
           const endRow = parseInt(match[4]);
           
-          if (rowNum >= startRow && rowNum <= endRow && 
-              colNum >= startCol && colNum <= endCol) {
-            return {
-              isMerged: true,
-              isTopLeft: rowNum === startRow && colNum === startCol,
-              startCol: startCol,
-              startRow: startRow,
-              colSpan: endCol - startCol + 1,
-              rowSpan: endRow - startRow + 1
-            };
+          for (let r = startRow; r <= endRow; r++) {
+            for (let c = startCol; c <= endCol; c++) {
+              mergedCellsMap.set(`${r}-${c}`, {
+                isTopLeft: r === startRow && c === startCol,
+                startRow, startCol, endRow, endCol,
+                rowSpan: endRow - startRow + 1,
+                colSpan: endCol - startCol + 1
+              });
+            }
           }
         }
-      }
-      return { isMerged: false };
+      });
     }
 
     // Calculate column widths
     const colWidths = {};
     for (let colNum = minCol; colNum <= maxCol; colNum++) {
       const column = worksheet.getColumn(colNum);
-      const width = column.width || 10;
-      colWidths[colNum] = width * 5.2;
+      colWidths[colNum] = (column.width || 10) * 4.8;
     }
 
     // Scale to fit page width
     const availableWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
     const totalColWidth = Object.values(colWidths).reduce((a, b) => a + b, 0);
-    const scale = availableWidth / totalColWidth;
+    const widthScale = availableWidth / totalColWidth;
     
     Object.keys(colWidths).forEach(col => {
-      colWidths[col] *= scale;
+      colWidths[col] *= widthScale;
     });
 
     // Calculate row heights
     const rowHeights = {};
     for (let rowNum = minRow; rowNum <= maxRow; rowNum++) {
       const row = worksheet.getRow(rowNum);
-      const height = row.height || 15;
-      rowHeights[rowNum] = height * 1.1;
+      rowHeights[rowNum] = (row.height || 15) * 0.95;
     }
 
-    // Calculate total height and scale if needed to fit one page
+    // FORCE FIT TO ONE PAGE - Scale height aggressively
     const totalHeight = Object.values(rowHeights).reduce((a, b) => a + b, 0);
     const availableHeight = doc.page.height - doc.page.margins.top - doc.page.margins.bottom;
+    const heightScale = availableHeight / totalHeight;
     
-    let heightScale = 1;
-    if (totalHeight > availableHeight) {
-      heightScale = availableHeight / totalHeight;
-      Object.keys(rowHeights).forEach(row => {
-        rowHeights[row] *= heightScale;
-      });
-    }
+    Object.keys(rowHeights).forEach(row => {
+      rowHeights[row] *= heightScale;
+    });
 
     // Extract images
-    const images = {};
+    const images = new Map();
     if (worksheet.getImages) {
       worksheet.getImages().forEach(img => {
-        const imageId = img.imageId;
-        const image = workbook.model.media.find(m => m.index === imageId);
-        if (image) {
-          const row = img.range.tl.nativeRow + 1; // Convert to 1-based
-          const col = img.range.tl.nativeCol + 1;
-          images[`${row}-${col}`] = {
-            buffer: image.buffer,
-            extension: image.extension
-          };
+        try {
+          const imageId = img.imageId;
+          const image = workbook.model.media.find(m => m.index === imageId);
+          if (image && image.buffer) {
+            const row = img.range.tl.nativeRow + 1;
+            const col = img.range.tl.nativeCol + 1;
+            const rowEnd = img.range.br ? img.range.br.nativeRow + 1 : row;
+            const colEnd = img.range.br ? img.range.br.nativeCol + 1 : col;
+            
+            images.set(`${row}-${col}`, {
+              buffer: image.buffer,
+              extension: image.extension,
+              rowSpan: rowEnd - row + 1,
+              colSpan: colEnd - col + 1
+            });
+          }
+        } catch (err) {
+          console.error('Image extraction error:', err);
         }
       });
     }
 
     let currentY = doc.page.margins.top;
 
-    // Render each row
+    // Render all rows
     for (let rowNum = minRow; rowNum <= maxRow; rowNum++) {
       const row = worksheet.getRow(rowNum);
       const rowHeight = rowHeights[rowNum];
       let currentX = doc.page.margins.left;
 
-      // Render each cell in the row
       for (let colNum = minCol; colNum <= maxCol; colNum++) {
+        const cellKey = `${rowNum}-${colNum}`;
+        const mergeInfo = mergedCellsMap.get(cellKey);
         const cell = row.getCell(colNum);
         const cellWidth = colWidths[colNum];
-        const mergeInfo = getMergeInfo(rowNum, colNum);
 
-        // Skip if this is a merged cell but not the top-left
-        if (mergeInfo.isMerged && !mergeInfo.isTopLeft) {
+        // Skip if merged but not top-left
+        if (mergeInfo && !mergeInfo.isTopLeft) {
           currentX += cellWidth;
           continue;
         }
@@ -217,22 +181,23 @@ async function createPDF(worksheet, workbook) {
         const cellX = currentX;
         const cellY = currentY;
         
+        // Calculate final dimensions for merged cells
         let finalWidth = cellWidth;
         let finalHeight = rowHeight;
         
-        if (mergeInfo.isMerged) {
+        if (mergeInfo && mergeInfo.isTopLeft) {
           finalWidth = 0;
-          for (let i = 0; i < mergeInfo.colSpan; i++) {
-            finalWidth += colWidths[mergeInfo.startCol + i] || 0;
+          for (let c = mergeInfo.startCol; c <= mergeInfo.endCol; c++) {
+            finalWidth += colWidths[c] || 0;
           }
           finalHeight = 0;
-          for (let i = 0; i < mergeInfo.rowSpan; i++) {
-            finalHeight += rowHeights[mergeInfo.startRow + i] || 0;
+          for (let r = mergeInfo.startRow; r <= mergeInfo.endRow; r++) {
+            finalHeight += rowHeights[r] || 0;
           }
         }
 
-        // Draw cell background
-        if (cell.style && cell.style.fill && cell.style.fill.fgColor) {
+        // Draw background color
+        if (cell.style?.fill?.fgColor?.argb) {
           const color = cell.style.fill.fgColor.argb;
           if (color && color !== 'FFFFFFFF' && color !== '00000000') {
             const rgb = hexToRgb(color);
@@ -244,90 +209,103 @@ async function createPDF(worksheet, workbook) {
           }
         }
 
-        // Draw cell border
-        const borderColor = '#000000';
-        doc.strokeColor(borderColor).lineWidth(0.5);
+        // Draw border
+        doc.strokeColor('#000000').lineWidth(0.3);
         doc.rect(cellX, cellY, finalWidth, finalHeight).stroke();
 
-        // Check for image in this cell
-        const imgKey = `${rowNum}-${colNum}`;
-        if (images[imgKey]) {
+        // Draw image if exists
+        const imgData = images.get(cellKey);
+        if (imgData) {
           try {
-            const imgWidth = finalWidth - 4;
-            const imgHeight = finalHeight - 4;
-            doc.image(images[imgKey].buffer, cellX + 2, cellY + 2, {
+            const imgWidth = finalWidth - 2;
+            const imgHeight = finalHeight - 2;
+            doc.image(imgData.buffer, cellX + 1, cellY + 1, {
               fit: [imgWidth, imgHeight],
               align: 'center',
               valign: 'center'
             });
           } catch (err) {
-            console.error('Image rendering error:', err);
+            console.error('Image render error:', err);
           }
         }
 
-        // Draw cell text
-        let cellValue = '';
-        if (cell.value !== null && cell.value !== undefined) {
-          if (typeof cell.value === 'object' && cell.value.text) {
-            cellValue = cell.value.text;
-          } else if (typeof cell.value === 'object' && cell.value.result !== undefined) {
-            cellValue = String(cell.value.result);
-          } else if (cell.value === true) {
-            cellValue = '✓';
-          } else {
-            cellValue = String(cell.value);
+        // Draw text content
+        if (!imgData) {
+          let cellValue = '';
+          
+          if (cell.value !== null && cell.value !== undefined) {
+            if (typeof cell.value === 'boolean') {
+              cellValue = cell.value ? '✓' : '';
+            } else if (typeof cell.value === 'object' && cell.value.text) {
+              cellValue = cell.value.text;
+            } else if (typeof cell.value === 'object' && cell.value.result !== undefined) {
+              cellValue = String(cell.value.result);
+            } else {
+              cellValue = String(cell.value);
+            }
           }
-        }
 
-        if (cellValue && !images[imgKey]) {
-          // Set font style
-          let fontStyle = 'Helvetica';
-          if (cell.font) {
-            if (cell.font.bold && cell.font.italic) {
+          if (cellValue) {
+            // Handle checkmark symbol
+            if (cellValue === 'TRUE' || cellValue === 'true' || cellValue === '1') {
+              cellValue = '✓';
+            }
+            
+            // Font styling
+            let fontStyle = 'Helvetica';
+            if (cell.font?.bold && cell.font?.italic) {
               fontStyle = 'Helvetica-BoldOblique';
-            } else if (cell.font.bold) {
+            } else if (cell.font?.bold) {
               fontStyle = 'Helvetica-Bold';
-            } else if (cell.font.italic) {
+            } else if (cell.font?.italic) {
               fontStyle = 'Helvetica-Oblique';
             }
-          }
-          doc.font(fontStyle);
+            doc.font(fontStyle);
 
-          // Set font size (scaled)
-          let fontSize = cell.font && cell.font.size ? cell.font.size : 9;
-          fontSize = Math.max(fontSize * heightScale, 7); // Minimum 7pt
-          doc.fontSize(fontSize);
+            // Font size - scaled down
+            const baseFontSize = cell.font?.size || 9;
+            const fontSize = Math.max(Math.min(baseFontSize * heightScale, 9), 6);
+            doc.fontSize(fontSize);
 
-          // Set font color
-          if (cell.font && cell.font.color && cell.font.color.argb) {
-            const textColor = hexToRgb(cell.font.color.argb);
-            if (textColor) {
-              doc.fillColor(textColor);
+            // Font color
+            const textColor = cell.font?.color?.argb ? hexToRgb(cell.font.color.argb) : null;
+            doc.fillColor(textColor || '#000000');
+
+            // Text alignment
+            const align = cell.alignment?.horizontal || 'left';
+            const vAlign = cell.alignment?.vertical || 'middle';
+            
+            const padding = 1.5;
+            const textWidth = finalWidth - (padding * 2);
+            
+            let textY = cellY + (finalHeight - fontSize) / 2;
+            if (vAlign === 'top') {
+              textY = cellY + padding;
+            } else if (vAlign === 'bottom') {
+              textY = cellY + finalHeight - fontSize - padding;
             }
-          } else {
-            doc.fillColor('#000000');
-          }
 
-          // Handle text alignment
-          const align = cell.alignment && cell.alignment.horizontal ? cell.alignment.horizontal : 'left';
-          const verticalAlign = cell.alignment && cell.alignment.vertical ? cell.alignment.vertical : 'middle';
-          
-          const padding = 2;
-          const textWidth = finalWidth - (padding * 2);
-          let textY = cellY + (finalHeight - fontSize) / 2;
-          
-          if (verticalAlign === 'top') {
-            textY = cellY + padding;
-          } else if (verticalAlign === 'bottom') {
-            textY = cellY + finalHeight - fontSize - padding;
+            // Handle text wrapping for merged cells or long text
+            const shouldWrap = mergeInfo || cellValue.length > 30;
+            
+            try {
+              doc.text(cellValue, cellX + padding, textY, {
+                width: textWidth,
+                align: align,
+                lineBreak: shouldWrap,
+                ellipsis: !shouldWrap,
+                height: finalHeight - (padding * 2)
+              });
+            } catch (err) {
+              // Fallback for Arabic or special characters
+              doc.text(cellValue.replace(/[^\x00-\x7F]/g, '?'), cellX + padding, textY, {
+                width: textWidth,
+                align: align,
+                lineBreak: false,
+                ellipsis: true
+              });
+            }
           }
-
-          doc.text(cellValue, cellX + padding, textY, {
-            width: textWidth,
-            align: align,
-            lineBreak: false,
-            ellipsis: true
-          });
         }
 
         currentX += cellWidth;
