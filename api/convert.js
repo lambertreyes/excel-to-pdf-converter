@@ -65,13 +65,22 @@ async function createPDF(worksheet, workbook) {
     doc.on('error', reject);
 
     // Get merged cells info
-    const mergedCells = worksheet._merges || {};
-    const mergedRanges = Object.keys(mergedCells).map(key => mergedCells[key]);
+    const mergedRanges = [];
+    for (const key in worksheet._merges) {
+      const range = worksheet._merges[key];
+      if (typeof range === 'string') {
+        mergedRanges.push(range);
+      } else if (range.model) {
+        // ExcelJS structure: {model: 'A1:B2'}
+        mergedRanges.push(range.model);
+      }
+    }
 
     // Helper to check if cell is part of merged range
     function getMergeInfo(rowNum, colNum) {
       for (const range of mergedRanges) {
-        const match = range.match(/([A-Z]+)(\d+):([A-Z]+)(\d+)/);
+        const rangeStr = typeof range === 'string' ? range : String(range);
+        const match = rangeStr.match(/([A-Z]+)(\d+):([A-Z]+)(\d+)/);
         if (match) {
           const startCol = columnLetterToNumber(match[1]);
           const startRow = parseInt(match[2]);
