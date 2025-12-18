@@ -53,10 +53,48 @@ export default async function handler(req, res) {
 
 async function createPDF(worksheet, workbook) {
   return new Promise((resolve, reject) => {
+    // Check for print area
+    let minRow = 1, maxRow = 49, minCol = 1, maxCol = 15;
+    
+    if (worksheet.pageSetup && worksheet.pageSetup.printArea) {
+      const printArea = worksheet.pageSetup.printArea;
+      const match = printArea.match(/([A-Z]+)(\d+):([A-Z]+)(\d+)/);
+      if (match) {
+        minCol = columnLetterToNumber(match[1]);
+        minRow = parseInt(match[2]);
+        maxCol = columnLetterToNumber(match[3]);
+        maxRow = parseInt(match[4]);
+      }
+    }
+
+    // Detect actual data boundaries if no print area
+    if (!worksheet.pageSetup || !worksheet.pageSetup.printArea) {
+      let hasData = false;
+      worksheet.eachRow((row, rowNum) => {
+        row.eachCell({ includeEmpty: false }, (cell, colNum) => {
+          if (cell.value !== null && cell.value !== undefined && cell.value !== '') {
+            hasData = true;
+            maxRow = Math.max(maxRow, rowNum);
+            maxCol = Math.max(maxCol, colNum);
+          }
+        });
+      });
+      
+      if (hasData) {
+        // Add small buffer
+        maxRow = Math.min(maxRow + 1, 49);
+        maxCol = Math.min(maxCol, 15);
+      }
+    }
+
+    // Determine page orientation from Excel settings
+    const orientation = worksheet.pageSetup && worksheet.pageSetup.orientation === 'landscape' ? 'landscape' : 'portrait';
+    
     const doc = new PDFDocument({ 
       size: 'A4',
-      margin: 25,
-      layout: 'portrait'
+      margin: 20,
+      layout: orientation,
+      bufferPages: true
     });
     
     const chunks = [];
@@ -71,7 +109,6 @@ async function createPDF(worksheet, workbook) {
       if (typeof range === 'string') {
         mergedRanges.push(range);
       } else if (range.model) {
-        // ExcelJS structure: {model: 'A1:B2'}
         mergedRanges.push(range.model);
       }
     }
@@ -92,6 +129,8 @@ async function createPDF(worksheet, workbook) {
             return {
               isMerged: true,
               isTopLeft: rowNum === startRow && colNum === startCol,
+              startCol: startCol,
+              startRow: startRow,
               colSpan: endCol - startCol + 1,
               rowSpan: endRow - startRow + 1
             };
@@ -101,39 +140,42 @@ async function createPDF(worksheet, workbook) {
       return { isMerged: false };
     }
 
-    // Define range A1:O49
-    const minRow = 1;
-    const maxRow = 49;
-    const minCol = 1; // Column A
-    const maxCol = 15; // Column O
-
     // Calculate column widths
     const colWidths = {};
     for (let colNum = minCol; colNum <= maxCol; colNum++) {
       const column = worksheet.getColumn(colNum);
       const width = column.width || 10;
-      colWidths[colNum] = width * 5.5; // Adjusted for A4 portrait
+      colWidths[colNum] = width * 5.2;
     }
 
-    // Calculate available width and scale if needed
+    // Scale to fit page width
     const availableWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
     const totalColWidth = Object.values(colWidths).reduce((a, b) => a + b, 0);
-    const scale = Math.min(1, availableWidth / totalColWidth);
+    const scale = availableWidth / totalColWidth;
     
     Object.keys(colWidths).forEach(col => {
       colWidths[col] *= scale;
     });
 
-    // Dynamic row heights based on content
+    // Calculate row heights
     const rowHeights = {};
     for (let rowNum = minRow; rowNum <= maxRow; rowNum++) {
       const row = worksheet.getRow(rowNum);
       const height = row.height || 15;
-      rowHeights[rowNum] = Math.max(height * 1.2, 15); // Minimum 15pt
+      rowHeights[rowNum] = height * 1.1;
     }
 
-    let currentY = doc.page.margins.top;
-    const pageHeight = doc.page.height - doc.page.margins.bottom;
+    // Calculate total height and scale if needed to fit one page
+    const totalHeight = Object.values(rowHeights).reduce((a, b) => a + b, 0);
+    const availableHeight = doc.page.height - doc.page.margins.top - doc.page.margins.bottom;
+    
+    let heightScale = 1;
+    if (totalHeight > availableHeight) {
+      heightScale = availableHeight / totalHeight;
+      Object.keys(rowHeights).forEach(row => {
+        rowHeights[row] *= heightScale;
+      });
+    }
 
     // Extract images
     const images = {};
@@ -142,27 +184,22 @@ async function createPDF(worksheet, workbook) {
         const imageId = img.imageId;
         const image = workbook.model.media.find(m => m.index === imageId);
         if (image) {
-          images[img.range.tl.nativeRow] = {
+          const row = img.range.tl.nativeRow + 1; // Convert to 1-based
+          const col = img.range.tl.nativeCol + 1;
+          images[`${row}-${col}`] = {
             buffer: image.buffer,
-            extension: image.extension,
-            row: img.range.tl.nativeRow,
-            col: img.range.tl.nativeCol
+            extension: image.extension
           };
         }
       });
     }
 
+    let currentY = doc.page.margins.top;
+
     // Render each row
     for (let rowNum = minRow; rowNum <= maxRow; rowNum++) {
       const row = worksheet.getRow(rowNum);
       const rowHeight = rowHeights[rowNum];
-
-      // Check if we need a new page
-      if (currentY + rowHeight > pageHeight) {
-        doc.addPage();
-        currentY = doc.page.margins.top;
-      }
-
       let currentX = doc.page.margins.left;
 
       // Render each cell in the row
@@ -179,12 +216,20 @@ async function createPDF(worksheet, workbook) {
 
         const cellX = currentX;
         const cellY = currentY;
-        const finalWidth = mergeInfo.isMerged ? 
-          Array.from({length: mergeInfo.colSpan}, (_, i) => colWidths[colNum + i]).reduce((a,b) => a+b, 0) : 
-          cellWidth;
-        const finalHeight = mergeInfo.isMerged ? 
-          Array.from({length: mergeInfo.rowSpan}, (_, i) => rowHeights[rowNum + i]).reduce((a,b) => a+b, 0) : 
-          rowHeight;
+        
+        let finalWidth = cellWidth;
+        let finalHeight = rowHeight;
+        
+        if (mergeInfo.isMerged) {
+          finalWidth = 0;
+          for (let i = 0; i < mergeInfo.colSpan; i++) {
+            finalWidth += colWidths[mergeInfo.startCol + i] || 0;
+          }
+          finalHeight = 0;
+          for (let i = 0; i < mergeInfo.rowSpan; i++) {
+            finalHeight += rowHeights[mergeInfo.startRow + i] || 0;
+          }
+        }
 
         // Draw cell background
         if (cell.style && cell.style.fill && cell.style.fill.fgColor) {
@@ -205,12 +250,12 @@ async function createPDF(worksheet, workbook) {
         doc.rect(cellX, cellY, finalWidth, finalHeight).stroke();
 
         // Check for image in this cell
-        const imgData = images[rowNum - 1]; // 0-indexed
-        if (imgData && imgData.col === colNum - 1) {
+        const imgKey = `${rowNum}-${colNum}`;
+        if (images[imgKey]) {
           try {
             const imgWidth = finalWidth - 4;
             const imgHeight = finalHeight - 4;
-            doc.image(imgData.buffer, cellX + 2, cellY + 2, {
+            doc.image(images[imgKey].buffer, cellX + 2, cellY + 2, {
               fit: [imgWidth, imgHeight],
               align: 'center',
               valign: 'center'
@@ -227,12 +272,14 @@ async function createPDF(worksheet, workbook) {
             cellValue = cell.value.text;
           } else if (typeof cell.value === 'object' && cell.value.result !== undefined) {
             cellValue = String(cell.value.result);
+          } else if (cell.value === true) {
+            cellValue = '✓';
           } else {
             cellValue = String(cell.value);
           }
         }
 
-        if (cellValue) {
+        if (cellValue && !images[imgKey]) {
           // Set font style
           let fontStyle = 'Helvetica';
           if (cell.font) {
@@ -246,8 +293,9 @@ async function createPDF(worksheet, workbook) {
           }
           doc.font(fontStyle);
 
-          // Set font size
-          const fontSize = cell.font && cell.font.size ? Math.min(cell.font.size, 11) : 9;
+          // Set font size (scaled)
+          let fontSize = cell.font && cell.font.size ? cell.font.size : 9;
+          fontSize = Math.max(fontSize * heightScale, 7); // Minimum 7pt
           doc.fontSize(fontSize);
 
           // Set font color
@@ -264,7 +312,7 @@ async function createPDF(worksheet, workbook) {
           const align = cell.alignment && cell.alignment.horizontal ? cell.alignment.horizontal : 'left';
           const verticalAlign = cell.alignment && cell.alignment.vertical ? cell.alignment.vertical : 'middle';
           
-          const padding = 3;
+          const padding = 2;
           const textWidth = finalWidth - (padding * 2);
           let textY = cellY + (finalHeight - fontSize) / 2;
           
@@ -274,10 +322,7 @@ async function createPDF(worksheet, workbook) {
             textY = cellY + finalHeight - fontSize - padding;
           }
 
-          // Handle checkmarks and special characters
-          const displayValue = cellValue === 'true' ? '✓' : cellValue;
-
-          doc.text(displayValue, cellX + padding, textY, {
+          doc.text(cellValue, cellX + padding, textY, {
             width: textWidth,
             align: align,
             lineBreak: false,
