@@ -1,7 +1,6 @@
 // api/convert.js
 import ExcelJS from 'exceljs';
 import PDFDocument from 'pdfkit';
-import { Readable } from 'stream';
 
 export const config = {
   api: {
@@ -34,7 +33,7 @@ export default async function handler(req, res) {
     const worksheet = workbook.worksheets[0];
     
     // Create PDF
-    const pdfBuffer = await createPDF(worksheet);
+    const pdfBuffer = await createPDF(worksheet, workbook);
     
     // Return PDF as base64
     res.status(200).json({
@@ -52,11 +51,11 @@ export default async function handler(req, res) {
   }
 }
 
-async function createPDF(worksheet) {
+async function createPDF(worksheet, workbook) {
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({ 
       size: 'A4',
-      margin: 40,
+      margin: 25,
       layout: 'portrait'
     });
     
@@ -65,67 +64,160 @@ async function createPDF(worksheet) {
     doc.on('end', () => resolve(Buffer.concat(chunks)));
     doc.on('error', reject);
 
+    // Get merged cells info
+    const mergedCells = worksheet._merges || {};
+    const mergedRanges = Object.keys(mergedCells).map(key => mergedCells[key]);
+
+    // Helper to check if cell is part of merged range
+    function getMergeInfo(rowNum, colNum) {
+      for (const range of mergedRanges) {
+        const match = range.match(/([A-Z]+)(\d+):([A-Z]+)(\d+)/);
+        if (match) {
+          const startCol = columnLetterToNumber(match[1]);
+          const startRow = parseInt(match[2]);
+          const endCol = columnLetterToNumber(match[3]);
+          const endRow = parseInt(match[4]);
+          
+          if (rowNum >= startRow && rowNum <= endRow && 
+              colNum >= startCol && colNum <= endCol) {
+            return {
+              isMerged: true,
+              isTopLeft: rowNum === startRow && colNum === startCol,
+              colSpan: endCol - startCol + 1,
+              rowSpan: endRow - startRow + 1
+            };
+          }
+        }
+      }
+      return { isMerged: false };
+    }
+
+    // Define range A1:O49
+    const minRow = 1;
+    const maxRow = 49;
+    const minCol = 1; // Column A
+    const maxCol = 15; // Column O
+
     // Calculate column widths
     const colWidths = {};
-    let maxCol = 0;
-    
-    worksheet.eachRow((row, rowNum) => {
-      row.eachCell((cell, colNum) => {
-        maxCol = Math.max(maxCol, colNum);
-        const width = worksheet.getColumn(colNum).width || 10;
-        colWidths[colNum] = Math.max(colWidths[colNum] || 0, width * 7);
-      });
-    });
+    for (let colNum = minCol; colNum <= maxCol; colNum++) {
+      const column = worksheet.getColumn(colNum);
+      const width = column.width || 10;
+      colWidths[colNum] = width * 5.5; // Adjusted for A4 portrait
+    }
 
-    // Calculate available width and adjust columns proportionally
-    const totalWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+    // Calculate available width and scale if needed
+    const availableWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
     const totalColWidth = Object.values(colWidths).reduce((a, b) => a + b, 0);
-    const scale = totalWidth / totalColWidth;
+    const scale = Math.min(1, availableWidth / totalColWidth);
     
     Object.keys(colWidths).forEach(col => {
       colWidths[col] *= scale;
     });
 
-    let startY = doc.y;
-    const rowHeight = 20;
+    // Dynamic row heights based on content
+    const rowHeights = {};
+    for (let rowNum = minRow; rowNum <= maxRow; rowNum++) {
+      const row = worksheet.getRow(rowNum);
+      const height = row.height || 15;
+      rowHeights[rowNum] = Math.max(height * 1.2, 15); // Minimum 15pt
+    }
+
+    let currentY = doc.page.margins.top;
+    const pageHeight = doc.page.height - doc.page.margins.bottom;
+
+    // Extract images
+    const images = {};
+    if (worksheet.getImages) {
+      worksheet.getImages().forEach(img => {
+        const imageId = img.imageId;
+        const image = workbook.model.media.find(m => m.index === imageId);
+        if (image) {
+          images[img.range.tl.nativeRow] = {
+            buffer: image.buffer,
+            extension: image.extension,
+            row: img.range.tl.nativeRow,
+            col: img.range.tl.nativeCol
+          };
+        }
+      });
+    }
 
     // Render each row
-    worksheet.eachRow((row, rowNum) => {
-      let currentX = doc.page.margins.left;
-      const currentY = startY + (rowNum - 1) * rowHeight;
+    for (let rowNum = minRow; rowNum <= maxRow; rowNum++) {
+      const row = worksheet.getRow(rowNum);
+      const rowHeight = rowHeights[rowNum];
 
       // Check if we need a new page
-      if (currentY + rowHeight > doc.page.height - doc.page.margins.bottom) {
+      if (currentY + rowHeight > pageHeight) {
         doc.addPage();
-        startY = doc.page.margins.top;
-        currentX = doc.page.margins.left;
+        currentY = doc.page.margins.top;
       }
 
-      row.eachCell({ includeEmpty: true }, (cell, colNum) => {
-        const cellWidth = colWidths[colNum] || 60;
+      let currentX = doc.page.margins.left;
+
+      // Render each cell in the row
+      for (let colNum = minCol; colNum <= maxCol; colNum++) {
+        const cell = row.getCell(colNum);
+        const cellWidth = colWidths[colNum];
+        const mergeInfo = getMergeInfo(rowNum, colNum);
+
+        // Skip if this is a merged cell but not the top-left
+        if (mergeInfo.isMerged && !mergeInfo.isTopLeft) {
+          currentX += cellWidth;
+          continue;
+        }
+
         const cellX = currentX;
         const cellY = currentY;
+        const finalWidth = mergeInfo.isMerged ? 
+          Array.from({length: mergeInfo.colSpan}, (_, i) => colWidths[colNum + i]).reduce((a,b) => a+b, 0) : 
+          cellWidth;
+        const finalHeight = mergeInfo.isMerged ? 
+          Array.from({length: mergeInfo.rowSpan}, (_, i) => rowHeights[rowNum + i]).reduce((a,b) => a+b, 0) : 
+          rowHeight;
 
         // Draw cell background
         if (cell.style && cell.style.fill && cell.style.fill.fgColor) {
           const color = cell.style.fill.fgColor.argb;
-          if (color && color !== 'FFFFFFFF') {
+          if (color && color !== 'FFFFFFFF' && color !== '00000000') {
             const rgb = hexToRgb(color);
             if (rgb) {
-              doc.rect(cellX, cellY, cellWidth, rowHeight)
-                 .fillAndStroke(rgb, '#000000');
+              doc.save();
+              doc.rect(cellX, cellY, finalWidth, finalHeight).fill(rgb);
+              doc.restore();
             }
           }
         }
 
         // Draw cell border
-        doc.rect(cellX, cellY, cellWidth, rowHeight).stroke();
+        const borderColor = '#000000';
+        doc.strokeColor(borderColor).lineWidth(0.5);
+        doc.rect(cellX, cellY, finalWidth, finalHeight).stroke();
+
+        // Check for image in this cell
+        const imgData = images[rowNum - 1]; // 0-indexed
+        if (imgData && imgData.col === colNum - 1) {
+          try {
+            const imgWidth = finalWidth - 4;
+            const imgHeight = finalHeight - 4;
+            doc.image(imgData.buffer, cellX + 2, cellY + 2, {
+              fit: [imgWidth, imgHeight],
+              align: 'center',
+              valign: 'center'
+            });
+          } catch (err) {
+            console.error('Image rendering error:', err);
+          }
+        }
 
         // Draw cell text
         let cellValue = '';
         if (cell.value !== null && cell.value !== undefined) {
           if (typeof cell.value === 'object' && cell.value.text) {
             cellValue = cell.value.text;
+          } else if (typeof cell.value === 'object' && cell.value.result !== undefined) {
+            cellValue = String(cell.value.result);
           } else {
             cellValue = String(cell.value);
           }
@@ -146,7 +238,7 @@ async function createPDF(worksheet) {
           doc.font(fontStyle);
 
           // Set font size
-          const fontSize = (cell.font && cell.font.size) ? cell.font.size : 10;
+          const fontSize = cell.font && cell.font.size ? Math.min(cell.font.size, 11) : 9;
           doc.fontSize(fontSize);
 
           // Set font color
@@ -163,22 +255,21 @@ async function createPDF(worksheet) {
           const align = cell.alignment && cell.alignment.horizontal ? cell.alignment.horizontal : 'left';
           const verticalAlign = cell.alignment && cell.alignment.vertical ? cell.alignment.vertical : 'middle';
           
-          let textX = cellX + 3;
-          if (align === 'center') {
-            textX = cellX + cellWidth / 2;
-          } else if (align === 'right') {
-            textX = cellX + cellWidth - 3;
-          }
-
-          let textY = cellY + (rowHeight - fontSize) / 2;
+          const padding = 3;
+          const textWidth = finalWidth - (padding * 2);
+          let textY = cellY + (finalHeight - fontSize) / 2;
+          
           if (verticalAlign === 'top') {
-            textY = cellY + 3;
+            textY = cellY + padding;
           } else if (verticalAlign === 'bottom') {
-            textY = cellY + rowHeight - fontSize - 3;
+            textY = cellY + finalHeight - fontSize - padding;
           }
 
-          doc.text(cellValue, textX, textY, {
-            width: cellWidth - 6,
+          // Handle checkmarks and special characters
+          const displayValue = cellValue === 'true' ? '✓' : cellValue;
+
+          doc.text(displayValue, cellX + padding, textY, {
+            width: textWidth,
             align: align,
             lineBreak: false,
             ellipsis: true
@@ -186,15 +277,24 @@ async function createPDF(worksheet) {
         }
 
         currentX += cellWidth;
-      });
-    });
+      }
+
+      currentY += rowHeight;
+    }
 
     doc.end();
   });
 }
 
+function columnLetterToNumber(letter) {
+  let column = 0;
+  for (let i = 0; i < letter.length; i++) {
+    column = column * 26 + letter.charCodeAt(i) - 64;
+  }
+  return column;
+}
+
 function hexToRgb(hex) {
-  // Remove alpha channel if present (ARGB format)
   if (hex.length === 8) {
     hex = hex.substring(2);
   }
