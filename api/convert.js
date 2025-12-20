@@ -29,154 +29,157 @@ export default async function handler(req, res) {
     // Decode base64 Excel file
     const buffer = Buffer.from(file, 'base64');
     
-    // Load workbook
-    const workbook = new ExcelJS.Workbook();
-    await workbook.xlsx.load(buffer);
-    const worksheet = workbook.worksheets[0];
+    console.log('Loading original workbook...');
     
-    console.log('Starting table removal process...');
+    // Load original workbook
+    const originalWorkbook = new ExcelJS.Workbook();
+    await originalWorkbook.xlsx.load(buffer);
+    const originalSheet = originalWorkbook.worksheets[0];
     
-    // COMPREHENSIVE TABLE REMOVAL
+    console.log('Creating new workbook without tables...');
     
-    // Step 1: Get table ranges before removal
-    const tableRanges = [];
-    if (worksheet.tables && worksheet.tables.length > 0) {
-      console.log(`Found ${worksheet.tables.length} Excel tables`);
-      worksheet.tables.forEach(table => {
-        console.log(`Table: ${table.name}, Range: ${table.ref}`);
-        tableRanges.push({
-          name: table.name,
-          ref: table.ref,
-          displayName: table.displayName
-        });
-      });
+    // Create a brand new workbook (no tables possible)
+    const newWorkbook = new ExcelJS.Workbook();
+    const newSheet = newWorkbook.addWorksheet(originalSheet.name || 'Sheet1');
+    
+    // Copy worksheet properties
+    newSheet.properties = { ...originalSheet.properties };
+    
+    // Copy page setup
+    if (originalSheet.pageSetup) {
+      newSheet.pageSetup = {
+        paperSize: 9, // A4
+        orientation: 'portrait',
+        fitToPage: true,
+        fitToWidth: 1,
+        fitToHeight: 1,
+        margins: {
+          left: 0.25,
+          right: 0.25,
+          top: 0.25,
+          bottom: 0.25,
+          header: 0,
+          footer: 0
+        },
+        printArea: originalSheet.pageSetup.printArea || 'A1:O49'
+      };
+    } else {
+      newSheet.pageSetup = {
+        paperSize: 9,
+        orientation: 'portrait',
+        fitToPage: true,
+        fitToWidth: 1,
+        fitToHeight: 1,
+        margins: {
+          left: 0.25,
+          right: 0.25,
+          top: 0.25,
+          bottom: 0.25,
+          header: 0,
+          footer: 0
+        },
+        printArea: 'A1:O49'
+      };
     }
     
-    // Step 2: Force remove tables by clearing the tables array
-    // This is more aggressive than removeTable()
-    if (worksheet.tables) {
-      worksheet.tables.length = 0; // Clear all tables
-      console.log('Cleared worksheet.tables array');
-    }
+    // Copy column widths
+    originalSheet.columns.forEach((col, index) => {
+      if (col && col.width) {
+        const newCol = newSheet.getColumn(index + 1);
+        newCol.width = col.width;
+      }
+    });
     
-    // Step 3: Clear internal table references
-    if (worksheet._tables) {
-      worksheet._tables = [];
-      console.log('Cleared internal _tables');
-    }
-    
-    // Step 4: Remove table parts from workbook
-    if (workbook._tables) {
-      workbook._tables = [];
-    }
-    
-    // Step 5: Remove AutoFilter (commonly used with tables)
-    if (worksheet.autoFilter) {
-      worksheet.autoFilter = null;
-      console.log('Removed autofilter');
-    }
-    
-    // Step 6: Clear defined names that reference tables
-    if (workbook.definedNames) {
-      const namesToRemove = [];
-      workbook.definedNames.forEach((name, index) => {
-        if (name && (name.includes('Table') || name.includes('_FilterDatabase'))) {
-          namesToRemove.push(index);
+    // Copy all rows with their properties
+    console.log('Copying cells...');
+    originalSheet.eachRow({ includeEmpty: true }, (row, rowNumber) => {
+      const newRow = newSheet.getRow(rowNumber);
+      
+      // Copy row height
+      if (row.height) {
+        newRow.height = row.height;
+      }
+      
+      // Copy each cell
+      row.eachCell({ includeEmpty: true }, (cell, colNumber) => {
+        const newCell = newRow.getCell(colNumber);
+        
+        // Copy value
+        newCell.value = cell.value;
+        
+        // Copy all styling
+        if (cell.style) {
+          newCell.style = {
+            numFmt: cell.style.numFmt,
+            font: cell.style.font ? { ...cell.style.font } : undefined,
+            alignment: cell.style.alignment ? { ...cell.style.alignment } : undefined,
+            protection: cell.style.protection ? { ...cell.style.protection } : undefined,
+            border: cell.style.border ? {
+              top: cell.style.border.top ? { ...cell.style.border.top } : undefined,
+              left: cell.style.border.left ? { ...cell.style.border.left } : undefined,
+              bottom: cell.style.border.bottom ? { ...cell.style.border.bottom } : undefined,
+              right: cell.style.border.right ? { ...cell.style.border.right } : undefined,
+              diagonal: cell.style.border.diagonal ? { ...cell.style.border.diagonal } : undefined
+            } : undefined,
+            fill: cell.style.fill ? { ...cell.style.fill } : undefined
+          };
         }
       });
-      // Remove in reverse order to maintain indices
-      namesToRemove.reverse().forEach(index => {
-        workbook.definedNames.splice(index, 1);
+      
+      newRow.commit();
+    });
+    
+    // Copy merged cells
+    if (originalSheet._merges) {
+      console.log('Copying merged cells...');
+      Object.values(originalSheet._merges).forEach(merge => {
+        try {
+          newSheet.mergeCells(merge);
+        } catch (err) {
+          console.log('Could not merge:', merge);
+        }
       });
-      if (namesToRemove.length > 0) {
-        console.log(`Removed ${namesToRemove.length} table-related defined names`);
-      }
     }
     
-    // Step 7: Ensure all cells have explicit styling (not table-inherited)
-    // This forces cells to keep their visual appearance even after table removal
-    if (tableRanges.length > 0) {
-      console.log('Applying explicit styling to table ranges...');
-      tableRanges.forEach(tableInfo => {
+    // Copy images
+    console.log('Copying images...');
+    if (originalWorkbook.model && originalWorkbook.model.media) {
+      originalWorkbook.model.media.forEach((media, index) => {
         try {
-          // Parse range safely
-          const match = tableInfo.ref.match(/([A-Z]+)(\d+):([A-Z]+)(\d+)/);
-          if (match) {
-            const startCol = columnLetterToNumber(match[1]);
-            const startRow = parseInt(match[2]);
-            const endCol = columnLetterToNumber(match[3]);
-            const endRow = parseInt(match[4]);
-            
-            // Iterate through all cells in table range
-            for (let row = startRow; row <= endRow; row++) {
-              for (let col = startCol; col <= endCol; col++) {
-                try {
-                  const cell = worksheet.getCell(row, col);
-                  
-                  // Force explicit border styling if cell has value
-                  if (cell && cell.value !== null && cell.value !== undefined) {
-                    // Only add borders if they don't exist or are incomplete
-                    const hasBorders = cell.border && 
-                                     (cell.border.top || cell.border.left || 
-                                      cell.border.bottom || cell.border.right);
-                    
-                    if (!hasBorders) {
-                      cell.border = {
-                        top: {style: 'thin'},
-                        left: {style: 'thin'},
-                        bottom: {style: 'thin'},
-                        right: {style: 'thin'}
-                      };
-                    }
-                  }
-                } catch (cellErr) {
-                  // Skip problematic cells
-                  console.log(`Skipping cell at row ${row}, col ${col}`);
-                }
+          const imageId = newWorkbook.addImage({
+            buffer: media.buffer,
+            extension: media.extension
+          });
+          
+          // Find where this image is placed in original
+          if (originalSheet.getImages) {
+            const images = originalSheet.getImages();
+            images.forEach(img => {
+              if (img.imageId === index) {
+                newSheet.addImage(imageId, {
+                  tl: img.range.tl,
+                  br: img.range.br,
+                  editAs: img.range.editAs
+                });
               }
-            }
-            console.log(`Applied styling to range: ${tableInfo.ref}`);
+            });
           }
         } catch (err) {
-          console.error('Error processing table range:', tableInfo.ref, err.message);
+          console.log('Could not copy image:', err.message);
         }
       });
     }
     
-    console.log('Table removal complete');
+    console.log('Creating clean Excel file...');
     
-    // Ensure print settings are optimal
-    worksheet.pageSetup = {
-      paperSize: 9, // A4
-      orientation: 'portrait',
-      fitToPage: true,
-      fitToWidth: 1,
-      fitToHeight: 1,
-      horizontalCentered: false,
-      verticalCentered: false,
-      margins: {
-        left: 0.25,
-        right: 0.25,
-        top: 0.25,
-        bottom: 0.25,
-        header: 0,
-        footer: 0
-      }
-    };
+    // Save the new workbook (completely clean, no tables)
+    const cleanBuffer = await newWorkbook.xlsx.writeBuffer();
     
-    // Set print area if not already set
-    if (!worksheet.pageSetup.printArea) {
-      worksheet.pageSetup.printArea = 'A1:O49';
-    }
-    
-    // Re-save the modified Excel (this finalizes the table removal)
-    console.log('Re-saving Excel without tables...');
-    const modifiedBuffer = await workbook.xlsx.writeBuffer();
-    console.log('Excel re-saved successfully');
+    console.log('Clean Excel created successfully');
     
     // Create form data for Gotenberg
     const form = new FormData();
-    form.append('files', modifiedBuffer, {
+    form.append('files', cleanBuffer, {
       filename: filename || 'document.xlsx',
       contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
     });
@@ -219,12 +222,4 @@ export default async function handler(req, res) {
       details: error.message 
     });
   }
-}
-
-function columnLetterToNumber(letter) {
-  let column = 0;
-  for (let i = 0; i < letter.length; i++) {
-    column = column * 26 + letter.charCodeAt(i) - 64;
-  }
-  return column;
 }
