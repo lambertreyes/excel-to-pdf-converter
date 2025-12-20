@@ -1,7 +1,7 @@
 // api/convert.js
 import FormData from 'form-data';
 import fetch from 'node-fetch';
-import ExcelJS from 'exceljs';
+import AdmZip from 'adm-zip';
 
 export const config = {
   api: {
@@ -29,157 +29,106 @@ export default async function handler(req, res) {
     // Decode base64 Excel file
     const buffer = Buffer.from(file, 'base64');
     
-    console.log('Loading original workbook...');
+    console.log('Removing Excel tables by manipulating XML...');
     
-    // Load original workbook
-    const originalWorkbook = new ExcelJS.Workbook();
-    await originalWorkbook.xlsx.load(buffer);
-    const originalSheet = originalWorkbook.worksheets[0];
+    // Excel files are ZIP archives - we'll extract, modify, and repack
+    const zip = new AdmZip(buffer);
+    const zipEntries = zip.getEntries();
     
-    console.log('Creating new workbook without tables...');
+    let tablesRemoved = 0;
+    let tablesFound = 0;
     
-    // Create a brand new workbook (no tables possible)
-    const newWorkbook = new ExcelJS.Workbook();
-    const newSheet = newWorkbook.addWorksheet(originalSheet.name || 'Sheet1');
-    
-    // Copy worksheet properties
-    newSheet.properties = { ...originalSheet.properties };
-    
-    // Copy page setup
-    if (originalSheet.pageSetup) {
-      newSheet.pageSetup = {
-        paperSize: 9, // A4
-        orientation: 'portrait',
-        fitToPage: true,
-        fitToWidth: 1,
-        fitToHeight: 1,
-        margins: {
-          left: 0.25,
-          right: 0.25,
-          top: 0.25,
-          bottom: 0.25,
-          header: 0,
-          footer: 0
-        },
-        printArea: originalSheet.pageSetup.printArea || 'A1:O49'
-      };
-    } else {
-      newSheet.pageSetup = {
-        paperSize: 9,
-        orientation: 'portrait',
-        fitToPage: true,
-        fitToWidth: 1,
-        fitToHeight: 1,
-        margins: {
-          left: 0.25,
-          right: 0.25,
-          top: 0.25,
-          bottom: 0.25,
-          header: 0,
-          footer: 0
-        },
-        printArea: 'A1:O49'
-      };
-    }
-    
-    // Copy column widths
-    originalSheet.columns.forEach((col, index) => {
-      if (col && col.width) {
-        const newCol = newSheet.getColumn(index + 1);
-        newCol.width = col.width;
+    // Step 1: Find and remove table XML files
+    const entriesToRemove = [];
+    zipEntries.forEach(entry => {
+      const entryName = entry.entryName;
+      
+      // Remove table definition files (xl/tables/tableX.xml)
+      if (entryName.startsWith('xl/tables/table') && entryName.endsWith('.xml')) {
+        entriesToRemove.push(entryName);
+        tablesFound++;
+        console.log(`Found table file: ${entryName}`);
       }
     });
     
-    // Copy all rows with their properties
-    console.log('Copying cells...');
-    originalSheet.eachRow({ includeEmpty: true }, (row, rowNumber) => {
-      const newRow = newSheet.getRow(rowNumber);
-      
-      // Copy row height
-      if (row.height) {
-        newRow.height = row.height;
-      }
-      
-      // Copy each cell
-      row.eachCell({ includeEmpty: true }, (cell, colNumber) => {
-        const newCell = newRow.getCell(colNumber);
-        
-        // Copy value
-        newCell.value = cell.value;
-        
-        // Copy all styling
-        if (cell.style) {
-          newCell.style = {
-            numFmt: cell.style.numFmt,
-            font: cell.style.font ? { ...cell.style.font } : undefined,
-            alignment: cell.style.alignment ? { ...cell.style.alignment } : undefined,
-            protection: cell.style.protection ? { ...cell.style.protection } : undefined,
-            border: cell.style.border ? {
-              top: cell.style.border.top ? { ...cell.style.border.top } : undefined,
-              left: cell.style.border.left ? { ...cell.style.border.left } : undefined,
-              bottom: cell.style.border.bottom ? { ...cell.style.border.bottom } : undefined,
-              right: cell.style.border.right ? { ...cell.style.border.right } : undefined,
-              diagonal: cell.style.border.diagonal ? { ...cell.style.border.diagonal } : undefined
-            } : undefined,
-            fill: cell.style.fill ? { ...cell.style.fill } : undefined
-          };
-        }
-      });
-      
-      newRow.commit();
+    // Delete table files
+    entriesToRemove.forEach(entryName => {
+      zip.deleteFile(entryName);
+      tablesRemoved++;
+      console.log(`Removed: ${entryName}`);
     });
     
-    // Copy merged cells
-    if (originalSheet._merges) {
-      console.log('Copying merged cells...');
-      Object.values(originalSheet._merges).forEach(merge => {
-        try {
-          newSheet.mergeCells(merge);
-        } catch (err) {
-          console.log('Could not merge:', merge);
-        }
-      });
+    // Step 2: Update worksheet XML to remove table references
+    zipEntries.forEach(entry => {
+      const entryName = entry.entryName;
+      
+      // Modify worksheet files (xl/worksheets/sheetX.xml)
+      if (entryName.startsWith('xl/worksheets/sheet') && entryName.endsWith('.xml')) {
+        let content = entry.getData().toString('utf8');
+        
+        // Remove <tableParts> section entirely
+        content = content.replace(/<tableParts[^>]*>[\s\S]*?<\/tableParts>/g, '');
+        
+        // Remove <tablePart> references
+        content = content.replace(/<tablePart[^>]*\/>/g, '');
+        
+        // Update the entry
+        zip.updateFile(entryName, Buffer.from(content, 'utf8'));
+        console.log(`Updated worksheet: ${entryName}`);
+      }
+    });
+    
+    // Step 3: Update [Content_Types].xml to remove table content type
+    const contentTypesEntry = zip.getEntry('[Content_Types].xml');
+    if (contentTypesEntry) {
+      let contentTypes = contentTypesEntry.getData().toString('utf8');
+      
+      // Remove table-related content types
+      contentTypes = contentTypes.replace(/<Override[^>]*PartName="\/xl\/tables\/[^"]*"[^>]*\/>/g, '');
+      
+      zip.updateFile('[Content_Types].xml', Buffer.from(contentTypes, 'utf8'));
+      console.log('Updated [Content_Types].xml');
     }
     
-    // Copy images
-    console.log('Copying images...');
-    if (originalWorkbook.model && originalWorkbook.model.media) {
-      originalWorkbook.model.media.forEach((media, index) => {
-        try {
-          const imageId = newWorkbook.addImage({
-            buffer: media.buffer,
-            extension: media.extension
-          });
-          
-          // Find where this image is placed in original
-          if (originalSheet.getImages) {
-            const images = originalSheet.getImages();
-            images.forEach(img => {
-              if (img.imageId === index) {
-                newSheet.addImage(imageId, {
-                  tl: img.range.tl,
-                  br: img.range.br,
-                  editAs: img.range.editAs
-                });
-              }
-            });
-          }
-        } catch (err) {
-          console.log('Could not copy image:', err.message);
-        }
-      });
+    // Step 4: Update xl/_rels/workbook.xml.rels to remove table relationships
+    const workbookRelsEntry = zip.getEntry('xl/_rels/workbook.xml.rels');
+    if (workbookRelsEntry) {
+      let workbookRels = workbookRelsEntry.getData().toString('utf8');
+      
+      // Remove table relationship references
+      workbookRels = workbookRels.replace(/<Relationship[^>]*Type="[^"]*\/table"[^>]*\/>/g, '');
+      
+      zip.updateFile('xl/_rels/workbook.xml.rels', Buffer.from(workbookRels, 'utf8'));
+      console.log('Updated workbook relationships');
     }
     
-    console.log('Creating clean Excel file...');
+    // Step 5: Update worksheet relationships
+    zipEntries.forEach(entry => {
+      const entryName = entry.entryName;
+      
+      if (entryName.startsWith('xl/worksheets/_rels/sheet') && entryName.endsWith('.xml.rels')) {
+        let content = entry.getData().toString('utf8');
+        
+        // Remove table relationship references
+        const originalLength = content.length;
+        content = content.replace(/<Relationship[^>]*Target="..\/tables\/table[^"]*"[^>]*\/>/g, '');
+        
+        if (content.length !== originalLength) {
+          zip.updateFile(entryName, Buffer.from(content, 'utf8'));
+          console.log(`Updated worksheet relationships: ${entryName}`);
+        }
+      }
+    });
     
-    // Save the new workbook (completely clean, no tables)
-    const cleanBuffer = await newWorkbook.xlsx.writeBuffer();
+    console.log(`Tables removed: ${tablesRemoved} of ${tablesFound} found`);
     
-    console.log('Clean Excel created successfully');
+    // Generate the modified Excel file
+    const modifiedBuffer = zip.toBuffer();
+    console.log('Created clean Excel file without tables');
     
     // Create form data for Gotenberg
     const form = new FormData();
-    form.append('files', cleanBuffer, {
+    form.append('files', modifiedBuffer, {
       filename: filename || 'document.xlsx',
       contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
     });
