@@ -9,6 +9,7 @@
     "deploy": "vercel --prod"
   },
   "dependencies": {
+    "exceljs": "^4.4.0",
     "form-data": "^4.0.0",
     "node-fetch": "^3.3.2"
   },
