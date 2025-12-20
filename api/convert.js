@@ -89,17 +89,12 @@ export default async function handler(req, res) {
       contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
     });
     
-    // LibreOffice conversion parameters
-    form.append('pdfa', 'PDF/A-1a');
-    form.append('pdfua', 'true');
+    // LibreOffice conversion parameters (simplified for compatibility)
     form.append('landscape', 'false');
-    form.append('nativePdfFormat', 'true');
+    form.append('nativePageRanges', '1-50'); // Allow up to 50 pages
     form.append('exportFormFields', 'false');
-    form.append('exportBookmarks', 'false');
     form.append('losslessImageCompression', 'true');
-    form.append('reduceImageResolution', 'false');
     form.append('quality', '100');
-    form.append('merge', 'false');
     
     // Call Gotenberg API
     const gotenbergResponse = await fetch(`${GOTENBERG_URL}/forms/libreoffice/convert`, {
