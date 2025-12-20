@@ -95,43 +95,53 @@ export default async function handler(req, res) {
     
     // Step 7: Ensure all cells have explicit styling (not table-inherited)
     // This forces cells to keep their visual appearance even after table removal
-    tableRanges.forEach(tableInfo => {
-      try {
-        const range = worksheet.getCell(tableInfo.ref.split(':')[0]).address + ':' + 
-                     worksheet.getCell(tableInfo.ref.split(':')[1]).address;
-        
-        // Parse range
-        const match = tableInfo.ref.match(/([A-Z]+)(\d+):([A-Z]+)(\d+)/);
-        if (match) {
-          const startCol = columnLetterToNumber(match[1]);
-          const startRow = parseInt(match[2]);
-          const endCol = columnLetterToNumber(match[3]);
-          const endRow = parseInt(match[4]);
-          
-          // Iterate through all cells in table range
-          for (let row = startRow; row <= endRow; row++) {
-            for (let col = startCol; col <= endCol; col++) {
-              const cell = worksheet.getCell(row, col);
-              
-              // Force explicit styling if cell has value
-              if (cell.value !== null && cell.value !== undefined) {
-                // Ensure borders are explicit
-                if (!cell.border || Object.keys(cell.border).length === 0) {
-                  cell.border = {
-                    top: {style: 'thin', color: {argb: 'FF000000'}},
-                    left: {style: 'thin', color: {argb: 'FF000000'}},
-                    bottom: {style: 'thin', color: {argb: 'FF000000'}},
-                    right: {style: 'thin', color: {argb: 'FF000000'}}
-                  };
+    if (tableRanges.length > 0) {
+      console.log('Applying explicit styling to table ranges...');
+      tableRanges.forEach(tableInfo => {
+        try {
+          // Parse range safely
+          const match = tableInfo.ref.match(/([A-Z]+)(\d+):([A-Z]+)(\d+)/);
+          if (match) {
+            const startCol = columnLetterToNumber(match[1]);
+            const startRow = parseInt(match[2]);
+            const endCol = columnLetterToNumber(match[3]);
+            const endRow = parseInt(match[4]);
+            
+            // Iterate through all cells in table range
+            for (let row = startRow; row <= endRow; row++) {
+              for (let col = startCol; col <= endCol; col++) {
+                try {
+                  const cell = worksheet.getCell(row, col);
+                  
+                  // Force explicit border styling if cell has value
+                  if (cell && cell.value !== null && cell.value !== undefined) {
+                    // Only add borders if they don't exist or are incomplete
+                    const hasBorders = cell.border && 
+                                     (cell.border.top || cell.border.left || 
+                                      cell.border.bottom || cell.border.right);
+                    
+                    if (!hasBorders) {
+                      cell.border = {
+                        top: {style: 'thin'},
+                        left: {style: 'thin'},
+                        bottom: {style: 'thin'},
+                        right: {style: 'thin'}
+                      };
+                    }
+                  }
+                } catch (cellErr) {
+                  // Skip problematic cells
+                  console.log(`Skipping cell at row ${row}, col ${col}`);
                 }
               }
             }
+            console.log(`Applied styling to range: ${tableInfo.ref}`);
           }
+        } catch (err) {
+          console.error('Error processing table range:', tableInfo.ref, err.message);
         }
-      } catch (err) {
-        console.error('Error processing table range:', err.message);
-      }
-    });
+      });
+    }
     
     console.log('Table removal complete');
     
