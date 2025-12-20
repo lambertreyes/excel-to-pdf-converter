@@ -2,6 +2,7 @@
 import FormData from 'form-data';
 import fetch from 'node-fetch';
 import AdmZip from 'adm-zip';
+import ExcelJS from 'exceljs';
 
 export const config = {
   api: {
@@ -26,122 +27,114 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: 'No file provided' });
     }
 
-    // Decode base64 Excel file
     const buffer = Buffer.from(file, 'base64');
     
-    console.log('Removing Excel tables by manipulating XML...');
+    console.log('Step 1: Removing table XML files...');
     
-    // Excel files are ZIP archives - we'll extract, modify, and repack
+    // STEP 1: Remove table XML files directly from ZIP
     const zip = new AdmZip(buffer);
     const zipEntries = zip.getEntries();
     
     let tablesRemoved = 0;
-    let tablesFound = 0;
-    
-    // Step 1: Find and remove table XML files
     const entriesToRemove = [];
+    
+    // Find and mark table files for removal
     zipEntries.forEach(entry => {
-      const entryName = entry.entryName;
-      
-      // Remove table definition files (xl/tables/tableX.xml)
-      if (entryName.startsWith('xl/tables/table') && entryName.endsWith('.xml')) {
-        entriesToRemove.push(entryName);
-        tablesFound++;
-        console.log(`Found table file: ${entryName}`);
+      const name = entry.entryName;
+      if (name.startsWith('xl/tables/') && name.endsWith('.xml')) {
+        entriesToRemove.push(name);
+        console.log(`Marking for removal: ${name}`);
       }
     });
     
     // Delete table files
-    entriesToRemove.forEach(entryName => {
-      zip.deleteFile(entryName);
+    entriesToRemove.forEach(name => {
+      zip.deleteFile(name);
       tablesRemoved++;
-      console.log(`Removed: ${entryName}`);
     });
     
-    // Step 2: Update worksheet XML to remove table references
+    // Update [Content_Types].xml
+    const contentTypesEntry = zip.getEntry('[Content_Types].xml');
+    if (contentTypesEntry) {
+      let content = contentTypesEntry.getData().toString('utf8');
+      content = content.replace(/<Override[^>]*PartName="\/xl\/tables\/[^"]*"[^>]*\/>/g, '');
+      zip.updateFile('[Content_Types].xml', Buffer.from(content, 'utf8'));
+    }
+    
+    // Update worksheet XML to remove tableParts
     zipEntries.forEach(entry => {
-      const entryName = entry.entryName;
-      
-      // Modify worksheet files (xl/worksheets/sheetX.xml)
-      if (entryName.startsWith('xl/worksheets/sheet') && entryName.endsWith('.xml')) {
+      const name = entry.entryName;
+      if (name.startsWith('xl/worksheets/sheet') && name.endsWith('.xml')) {
         let content = entry.getData().toString('utf8');
-        
-        // Remove <tableParts> section entirely
         content = content.replace(/<tableParts[^>]*>[\s\S]*?<\/tableParts>/g, '');
-        
-        // Remove <tablePart> references
         content = content.replace(/<tablePart[^>]*\/>/g, '');
-        
-        // Update the entry
-        zip.updateFile(entryName, Buffer.from(content, 'utf8'));
-        console.log(`Updated worksheet: ${entryName}`);
+        zip.updateFile(name, Buffer.from(content, 'utf8'));
       }
     });
     
-    // Step 3: Update [Content_Types].xml to remove table content type
-    const contentTypesEntry = zip.getEntry('[Content_Types].xml');
-    if (contentTypesEntry) {
-      let contentTypes = contentTypesEntry.getData().toString('utf8');
-      
-      // Remove table-related content types
-      contentTypes = contentTypes.replace(/<Override[^>]*PartName="\/xl\/tables\/[^"]*"[^>]*\/>/g, '');
-      
-      zip.updateFile('[Content_Types].xml', Buffer.from(contentTypes, 'utf8'));
-      console.log('Updated [Content_Types].xml');
-    }
-    
-    // Step 4: Update xl/_rels/workbook.xml.rels to remove table relationships
-    const workbookRelsEntry = zip.getEntry('xl/_rels/workbook.xml.rels');
-    if (workbookRelsEntry) {
-      let workbookRels = workbookRelsEntry.getData().toString('utf8');
-      
-      // Remove table relationship references
-      workbookRels = workbookRels.replace(/<Relationship[^>]*Type="[^"]*\/table"[^>]*\/>/g, '');
-      
-      zip.updateFile('xl/_rels/workbook.xml.rels', Buffer.from(workbookRels, 'utf8'));
-      console.log('Updated workbook relationships');
-    }
-    
-    // Step 5: Update worksheet relationships
+    // Update worksheet relationships
     zipEntries.forEach(entry => {
-      const entryName = entry.entryName;
-      
-      if (entryName.startsWith('xl/worksheets/_rels/sheet') && entryName.endsWith('.xml.rels')) {
+      const name = entry.entryName;
+      if (name.includes('/_rels/') && name.endsWith('.xml.rels')) {
         let content = entry.getData().toString('utf8');
-        
-        // Remove table relationship references
         const originalLength = content.length;
-        content = content.replace(/<Relationship[^>]*Target="..\/tables\/table[^"]*"[^>]*\/>/g, '');
-        
+        content = content.replace(/<Relationship[^>]*Target="[^"]*\/tables\/[^"]*"[^>]*\/>/g, '');
         if (content.length !== originalLength) {
-          zip.updateFile(entryName, Buffer.from(content, 'utf8'));
-          console.log(`Updated worksheet relationships: ${entryName}`);
+          zip.updateFile(name, Buffer.from(content, 'utf8'));
         }
       }
     });
     
-    console.log(`Tables removed: ${tablesRemoved} of ${tablesFound} found`);
+    console.log(`Tables removed: ${tablesRemoved}`);
     
-    // Generate the modified Excel file
-    const modifiedBuffer = zip.toBuffer();
-    console.log('Created clean Excel file without tables');
+    // Get the modified ZIP buffer
+    const modifiedZipBuffer = zip.toBuffer();
     
-    // Create form data for Gotenberg
+    console.log('Step 2: Loading with ExcelJS to normalize...');
+    
+    // STEP 2: Load the modified file with ExcelJS and re-save
+    // This normalizes the workbook structure (like Office Script does)
+    const workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.load(modifiedZipBuffer);
+    
+    // Force optimal page setup
+    const worksheet = workbook.worksheets[0];
+    worksheet.pageSetup = {
+      paperSize: 9,
+      orientation: 'portrait',
+      fitToPage: true,
+      fitToWidth: 1,
+      fitToHeight: 1,
+      margins: {
+        left: 0.25,
+        right: 0.25,
+        top: 0.25,
+        bottom: 0.25,
+        header: 0,
+        footer: 0
+      },
+      printArea: worksheet.pageSetup?.printArea || 'A1:O49'
+    };
+    
+    // Re-save to normalize the structure
+    console.log('Step 3: Re-saving workbook to normalize structure...');
+    const normalizedBuffer = await workbook.xlsx.writeBuffer();
+    
+    console.log('Step 4: Converting to PDF with Gotenberg...');
+    
+    // STEP 3: Send normalized file to Gotenberg
     const form = new FormData();
-    form.append('files', modifiedBuffer, {
+    form.append('files', normalizedBuffer, {
       filename: filename || 'document.xlsx',
       contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
     });
     
-    // LibreOffice conversion parameters
     form.append('landscape', 'false');
     form.append('nativePageRanges', '1-50');
     form.append('exportFormFields', 'false');
     form.append('losslessImageCompression', 'true');
     form.append('quality', '100');
     
-    // Call Gotenberg API
-    console.log('Sending to Gotenberg...');
     const gotenbergResponse = await fetch(`${GOTENBERG_URL}/forms/libreoffice/convert`, {
       method: 'POST',
       body: form,
@@ -153,11 +146,9 @@ export default async function handler(req, res) {
       throw new Error(`Gotenberg conversion failed: ${errorText}`);
     }
 
-    // Get PDF buffer
     const pdfBuffer = await gotenbergResponse.buffer();
-    console.log('PDF conversion successful');
+    console.log('Conversion successful!');
     
-    // Return PDF as base64
     res.status(200).json({
       success: true,
       pdf: pdfBuffer.toString('base64'),
