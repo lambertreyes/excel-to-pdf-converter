@@ -146,7 +146,10 @@ export default async function handler(req, res) {
       throw new Error(`Gotenberg conversion failed: ${errorText}`);
     }
 
-    const pdfBuffer = await gotenbergResponse.buffer();
+    // ✅ FIXED: Use arrayBuffer() instead of buffer()
+    const pdfArrayBuffer = await gotenbergResponse.arrayBuffer();
+    const pdfBuffer = Buffer.from(pdfArrayBuffer);
+    
     console.log('Conversion successful!');
     
     res.status(200).json({
