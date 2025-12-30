@@ -127,8 +127,7 @@ export default async function handler(req, res) {
         printArea: worksheet.pageSetup?.printArea
       };
       
-      // Ensure all rows are properly committed
-      worksheet.commit();
+      // ExcelJS automatically tracks changes, no commit needed
     });
     
     console.log('Step 3: Removing table definitions from XML structure...');
