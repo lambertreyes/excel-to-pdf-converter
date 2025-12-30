@@ -29,175 +29,189 @@ export default async function handler(req, res) {
 
     const buffer = Buffer.from(file, 'base64');
     
-    console.log('Step 1: Loading workbook...');
+    console.log('Step 1: Aggressive table removal from ZIP structure...');
     
-    // Load the workbook with ExcelJS first
-    const workbook = new ExcelJS.Workbook();
-    await workbook.xlsx.load(buffer);
-    
-    console.log('Step 2: Converting tables to ranges...');
-    
-    // Process each worksheet
-    workbook.eachSheet((worksheet, sheetId) => {
-      console.log(`Processing sheet: ${worksheet.name}`);
-      
-      // Get all tables in the worksheet
-      const tables = worksheet.tables || [];
-      
-      if (tables.length > 0) {
-        console.log(`Found ${tables.length} tables in ${worksheet.name}`);
-        
-        tables.forEach(table => {
-          console.log(`Converting table: ${table.name || 'unnamed'}`);
-          
-          // Get table range
-          const tableRef = table.ref || table.tableRef;
-          if (!tableRef) return;
-          
-          // Parse the range (e.g., "A1:E10")
-          const match = tableRef.match(/([A-Z]+)(\d+):([A-Z]+)(\d+)/);
-          if (!match) return;
-          
-          const [, startCol, startRow, endCol, endRow] = match;
-          const startRowNum = parseInt(startRow);
-          const endRowNum = parseInt(endRow);
-          
-          // Convert column letters to numbers
-          const colToNum = (col) => {
-            let num = 0;
-            for (let i = 0; i < col.length; i++) {
-              num = num * 26 + (col.charCodeAt(i) - 64);
-            }
-            return num;
-          };
-          
-          const startColNum = colToNum(startCol);
-          const endColNum = colToNum(endCol);
-          
-          // Iterate through all cells in the table range
-          for (let rowNum = startRowNum; rowNum <= endRowNum; rowNum++) {
-            const row = worksheet.getRow(rowNum);
-            
-            for (let colNum = startColNum; colNum <= endColNum; colNum++) {
-              const cell = row.getCell(colNum);
-              
-              // Convert formulas to values
-              if (cell.formula || cell.type === ExcelJS.ValueType.Formula) {
-                const value = cell.value;
-                // If it's a formula result, get the calculated value
-                if (value && typeof value === 'object' && 'result' in value) {
-                  cell.value = value.result;
-                } else if (cell.text) {
-                  // Use displayed text as fallback
-                  cell.value = cell.text;
-                }
-              }
-              
-              // Clear any table-specific styling that might cause issues
-              // Keep basic formatting but remove table references
-              if (cell.style) {
-                // Remove any named styles that might reference tables
-                delete cell.style.name;
-              }
-            }
-          }
-        });
-        
-        // Clear all table definitions from the worksheet
-        worksheet.tables = [];
-      }
-      
-      // Set optimal page setup for PDF conversion
-      worksheet.pageSetup = {
-        paperSize: 9, // A4
-        orientation: 'portrait',
-        fitToPage: true,
-        fitToWidth: 1,
-        fitToHeight: 0, // Allow multiple pages vertically if needed
-        margins: {
-          left: 0.25,
-          right: 0.25,
-          top: 0.25,
-          bottom: 0.25,
-          header: 0,
-          footer: 0
-        },
-        horizontalCentered: true,
-        verticalCentered: false,
-        printArea: worksheet.pageSetup?.printArea
-      };
-      
-      // ExcelJS automatically tracks changes, no commit needed
-    });
-    
-    console.log('Step 3: Removing table definitions from XML structure...');
-    
-    // Write the modified workbook to buffer
-    const modifiedBuffer = await workbook.xlsx.writeBuffer();
-    
-    // Additional cleanup: Remove table XML files from the ZIP
-    const zip = new AdmZip(modifiedBuffer);
+    // STEP 1: Aggressively remove ALL table-related XML
+    const zip = new AdmZip(buffer);
     const zipEntries = zip.getEntries();
     
-    let tablesRemoved = 0;
-    const entriesToRemove = [];
-    
-    // Find and mark table files for removal
+    // Remove table XML files
+    const tablesToRemove = [];
     zipEntries.forEach(entry => {
-      const name = entry.entryName;
-      if (name.startsWith('xl/tables/') && name.endsWith('.xml')) {
-        entriesToRemove.push(name);
+      if (entry.entryName.startsWith('xl/tables/')) {
+        tablesToRemove.push(entry.entryName);
       }
     });
     
-    // Delete table files
-    entriesToRemove.forEach(name => {
+    tablesToRemove.forEach(name => {
       zip.deleteFile(name);
-      tablesRemoved++;
-      console.log(`Removed: ${name}`);
+      console.log(`Deleted: ${name}`);
     });
     
-    // Clean up Content_Types.xml
+    // Clean Content_Types.xml - remove table definitions
     const contentTypesEntry = zip.getEntry('[Content_Types].xml');
     if (contentTypesEntry) {
       let content = contentTypesEntry.getData().toString('utf8');
       content = content.replace(/<Override[^>]*PartName="\/xl\/tables\/[^"]*"[^>]*\/>/g, '');
       zip.updateFile('[Content_Types].xml', Buffer.from(content, 'utf8'));
+      console.log('Cleaned [Content_Types].xml');
     }
     
-    // Clean up worksheet relationships
+    // Clean ALL worksheet XML files - remove tableParts completely
     zipEntries.forEach(entry => {
       const name = entry.entryName;
-      if (name.includes('/_rels/') && name.endsWith('.xml.rels')) {
+      if (name.startsWith('xl/worksheets/') && name.endsWith('.xml')) {
         let content = entry.getData().toString('utf8');
-        const originalLength = content.length;
-        content = content.replace(/<Relationship[^>]*Target="[^"]*\/tables\/[^"]*"[^>]*\/>/g, '');
-        if (content.length !== originalLength) {
+        const original = content;
+        
+        // Remove tableParts section entirely
+        content = content.replace(/<tableParts[^>]*>[\s\S]*?<\/tableParts>/g, '');
+        content = content.replace(/<tableParts[^>]*\/>/g, '');
+        content = content.replace(/<tablePart[^>]*\/>/g, '');
+        
+        if (content !== original) {
           zip.updateFile(name, Buffer.from(content, 'utf8'));
+          console.log(`Cleaned worksheet: ${name}`);
         }
       }
     });
     
-    console.log(`Tables removed from ZIP: ${tablesRemoved}`);
+    // Clean ALL relationship files - remove table relationships
+    zipEntries.forEach(entry => {
+      const name = entry.entryName;
+      if (name.endsWith('.xml.rels')) {
+        let content = entry.getData().toString('utf8');
+        const original = content;
+        
+        content = content.replace(/<Relationship[^>]*Type="[^"]*table"[^>]*\/>/gi, '');
+        content = content.replace(/<Relationship[^>]*Target="[^"]*\/tables\/[^"]*"[^>]*\/>/g, '');
+        
+        if (content !== original) {
+          zip.updateFile(name, Buffer.from(content, 'utf8'));
+          console.log(`Cleaned relationships: ${name}`);
+        }
+      }
+    });
     
-    // Get final cleaned buffer
-    const finalBuffer = zip.toBuffer();
+    const cleanedBuffer = zip.toBuffer();
+    
+    console.log('Step 2: Loading with ExcelJS and converting to values...');
+    
+    // STEP 2: Load with ExcelJS and convert everything to values
+    const workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.load(cleanedBuffer);
+    
+    // Create a NEW workbook and copy data as pure values
+    const newWorkbook = new ExcelJS.Workbook();
+    
+    workbook.eachSheet((sourceSheet, sheetId) => {
+      console.log(`Processing sheet: ${sourceSheet.name}`);
+      
+      const newSheet = newWorkbook.addWorksheet(sourceSheet.name, {
+        pageSetup: {
+          paperSize: 9,
+          orientation: 'portrait',
+          fitToPage: true,
+          fitToWidth: 1,
+          fitToHeight: 0,
+          margins: {
+            left: 0.25,
+            right: 0.25,
+            top: 0.25,
+            bottom: 0.25,
+            header: 0,
+            footer: 0
+          }
+        }
+      });
+      
+      // Copy column widths
+      sourceSheet.columns?.forEach((col, idx) => {
+        if (col.width) {
+          newSheet.getColumn(idx + 1).width = col.width;
+        }
+      });
+      
+      // Copy all rows with values only (no formulas)
+      sourceSheet.eachRow((sourceRow, rowNumber) => {
+        const newRow = newSheet.getRow(rowNumber);
+        
+        // Set row height
+        if (sourceRow.height) {
+          newRow.height = sourceRow.height;
+        }
+        
+        sourceRow.eachCell({ includeEmpty: true }, (sourceCell, colNumber) => {
+          const newCell = newRow.getCell(colNumber);
+          
+          // Get the ACTUAL VALUE (not formula)
+          let cellValue = sourceCell.value;
+          
+          // If it's a formula, get the result
+          if (sourceCell.type === ExcelJS.ValueType.Formula) {
+            cellValue = sourceCell.result || sourceCell.text || '';
+          } else if (cellValue && typeof cellValue === 'object') {
+            // Handle rich text and other complex values
+            if (cellValue.richText) {
+              cellValue = cellValue.richText.map(t => t.text).join('');
+            } else if (cellValue.result !== undefined) {
+              cellValue = cellValue.result;
+            } else if (cellValue.text) {
+              cellValue = cellValue.text;
+            }
+          }
+          
+          // Set the value
+          newCell.value = cellValue;
+          
+          // Copy styling (but not table-specific styles)
+          if (sourceCell.style) {
+            newCell.style = {
+              font: sourceCell.font,
+              alignment: sourceCell.alignment,
+              border: sourceCell.border,
+              fill: sourceCell.fill,
+              numFmt: sourceCell.numFmt
+            };
+          }
+        });
+        
+        newRow.commit();
+      });
+      
+      // Copy merged cells
+      if (sourceSheet.model?.merges) {
+        sourceSheet.model.merges.forEach(merge => {
+          newSheet.mergeCells(merge);
+        });
+      }
+      
+      // Set print area if exists
+      if (sourceSheet.pageSetup?.printArea) {
+        newSheet.pageSetup.printArea = sourceSheet.pageSetup.printArea;
+      }
+    });
+    
+    console.log('Step 3: Saving clean workbook...');
+    
+    // Save the NEW workbook (completely table-free)
+    const finalBuffer = await newWorkbook.xlsx.writeBuffer();
     
     console.log('Step 4: Converting to PDF with Gotenberg...');
     
-    // Send to Gotenberg
+    // STEP 3: Send to Gotenberg
     const form = new FormData();
     form.append('files', finalBuffer, {
       filename: filename || 'document.xlsx',
       contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
     });
     
+    // Gotenberg parameters for best quality
     form.append('landscape', 'false');
-    form.append('nativePageRanges', '1-50');
+    form.append('nativePageRanges', '1-100');
     form.append('exportFormFields', 'false');
     form.append('losslessImageCompression', 'true');
     form.append('quality', '100');
-    form.append('pdfa', 'PDF/A-1b'); // Better compatibility
     
     const gotenbergResponse = await fetch(`${GOTENBERG_URL}/forms/libreoffice/convert`, {
       method: 'POST',
@@ -213,7 +227,7 @@ export default async function handler(req, res) {
     const pdfArrayBuffer = await gotenbergResponse.arrayBuffer();
     const pdfBuffer = Buffer.from(pdfArrayBuffer);
     
-    console.log('Conversion successful!');
+    console.log('✅ Conversion successful!');
     
     res.status(200).json({
       success: true,
@@ -222,7 +236,7 @@ export default async function handler(req, res) {
     });
     
   } catch (error) {
-    console.error('Conversion error:', error);
+    console.error('❌ Conversion error:', error);
     res.status(500).json({ 
       error: 'Conversion failed', 
       details: error.message,
